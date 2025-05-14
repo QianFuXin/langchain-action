@@ -174,3 +174,5 @@ cython_debug/
 .pypirc
 
 config.py
+chroma_data
+uploads
