@@ -62,3 +62,48 @@ def tts(word, output_filename="output.mp3", play=False):
     else:
         print(f"请求失败，状态码：{response.status_code}")
         print(response.text)
+
+
+def text2image(prompt):
+    from utils import api_key
+    import requests
+    from urllib.parse import unquote, urlparse
+    import os
+    url = "https://api.siliconflow.cn/v1/images/generations"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": "Kwai-Kolors/Kolors",
+        "prompt": prompt,
+        "image_size": "1024x1024",
+        "batch_size": 1,
+        "num_inference_steps": 20,
+        "guidance_scale": 7.5
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    if response.status_code == 200:
+        result = response.json()
+        # 3. 提取图像 URL
+        image_url = result["images"][0]["url"]
+        print("✅ Image URL:", image_url)
+
+        # 4. 下载图片内容
+        image_response = requests.get(image_url)
+        if image_response.status_code == 200:
+            # 5. 解析文件名（可自定义）
+            parsed_url = urlparse(unquote(image_url))
+            filename = os.path.basename(parsed_url.path)
+            # 或自定义：filename = f"generated_{datetime.now().strftime('%Y%m%d_%H%M%S')}.jpg"
+            # 6. 保存到本地
+            with open(filename, "wb") as f:
+                f.write(image_response.content)
+            print(f"📁 Image saved as {filename}")
+        else:
+            print(f"❌ Failed to download image: {image_response.status_code}")
+    else:
+        print(f"❌ API call failed: {response.status_code}")
+        print(response.text)
