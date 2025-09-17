@@ -4,8 +4,11 @@
 from langchain_core.messages import HumanMessage, AIMessage, trim_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, MessagesState, StateGraph
+from prompt_toolkit import PromptSession
+
 from utils import *
 
+session = PromptSession(multiline=True)
 # 定义一个图
 workflow = StateGraph(state_schema=MessagesState)
 
@@ -37,7 +40,7 @@ app = workflow.compile(checkpointer=memory)
 config = {"configurable": {"thread_id": "abc123"}}
 
 while 1:
-    question = input("用户：")
+    question = session.prompt("用户：")
     input_messages = [HumanMessage(question)]
     print("机器人：", end="")
     for chunk, metadata in app.stream({"messages": input_messages}, config, stream_mode="messages"):
