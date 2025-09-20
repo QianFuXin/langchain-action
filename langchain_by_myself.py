@@ -1,5 +1,5 @@
 """
-自动原生实现工具调用、历史会话存储等功能
+支持本地工具 + 远程 MCP 工具调用
 """
 import os
 import time
@@ -11,6 +11,10 @@ import logging
 from pathlib import Path
 from openai import OpenAI
 from config import *
+
+import asyncio
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 
 # =========================
 # 日志配置
@@ -28,8 +32,19 @@ logger = logging.getLogger("function_call_playground")
 client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
 
 
+def parse_tool_result(result):
+    """统一解析 MCP 工具调用结果"""
+    if hasattr(result, "structuredContent") and result.structuredContent:
+        # 结构化优先
+        return result.structuredContent.get("result")
+    if hasattr(result, "content") and result.content:
+        # 文本结果
+        return getattr(result.content[0], "text", None)
+    return None
+
+
 # =========================
-# 工具装饰器
+# 本地工具注册
 # =========================
 def make_tool_decorator(registry: list, func_map: dict):
     TYPE_MAP = {int: "number", float: "number", str: "string", bool: "boolean"}
@@ -60,7 +75,7 @@ def make_tool_decorator(registry: list, func_map: dict):
             }
             registry.append(schema)
             func_map[func.__name__] = func
-            logger.debug(f"🔧 注册工具: {func.__name__} -> {schema}")
+            logger.debug(f"🔧 注册本地工具: {func.__name__}")
             return func
 
         return wrapper
@@ -68,17 +83,9 @@ def make_tool_decorator(registry: list, func_map: dict):
     return tool
 
 
-# =========================
-# 工具函数注册
-# =========================
 my_tools: list = []
 func_registry: dict = {}
 tool = make_tool_decorator(my_tools, func_registry)
-
-
-@tool("Compute the sum of two numbers")
-def add(a: float, b: float) -> float:
-    return a + b
 
 
 @tool("Calculate the product of two numbers")
@@ -104,33 +111,85 @@ STORE_DIR = DEFAULT_STORE
 
 
 def load_messages(session_id: str) -> list:
-    """加载历史对话"""
     path = STORE_DIR / f"{session_id}.pkl"
     if path.exists():
         try:
             with open(path, "rb") as f:
-                data = pickle.load(f)
-                logger.debug(f"📂 加载历史对话: {session_id}, 条数={len(data)}")
-                return data
+                return pickle.load(f)
         except Exception as e:
-            logger.warning(f"⚠️ 会话文件损坏，已忽略: {path}, error={e}")
+            logger.warning(f"⚠️ 会话文件损坏: {path}, error={e}")
             return []
     return []
 
 
 def save_messages(session_id: str, messages: list) -> None:
-    """保存对话"""
     path = STORE_DIR / f"{session_id}.pkl"
     try:
         with open(path, "wb") as f:
             pickle.dump(messages, f)
-        logger.debug(f"💾 已保存会话: {session_id}, 条数={len(messages)}")
     except Exception as e:
         logger.error(f"❌ 保存会话失败: {path}, error={e}")
 
 
 # =========================
-# 主逻辑
+# MCP 工具支持
+# =========================
+def tool_to_openai_format(tool):
+    return {
+        "type": "function",
+        "function": {
+            "name": tool.name,
+            "description": tool.description or "",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    k: {
+                        "type": "number" if v.get("type") in ("integer", "number") else v.get("type", "string")
+                    }
+                    for k, v in tool.inputSchema.get("properties", {}).items()
+                },
+                "required": tool.inputSchema.get("required", []),
+            },
+        },
+    }
+
+
+async def fetch_mcp_tools():
+    async with streamablehttp_client("http://localhost:8001/mcp") as (
+            read_stream,
+            write_stream,
+            _,
+    ):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            result = await session.list_tools()
+            tools = result.tools if hasattr(result, "tools") else result[-1]
+            return [tool_to_openai_format(tool) for tool in tools]
+
+
+def get_mcp_tools():
+    return asyncio.run(fetch_mcp_tools())
+
+
+async def call_mcp_tool(func_name: str, func_args: dict):
+    """调用 MCP Server 上的工具"""
+    async with streamablehttp_client("http://localhost:8001/mcp") as (
+            read_stream,
+            write_stream,
+            _,
+    ):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            result = await session.call_tool(func_name, func_args)
+            return parse_tool_result(result)
+
+
+def call_mcp_tool_sync(func_name: str, func_args: dict):
+    return asyncio.run(call_mcp_tool(func_name, func_args))
+
+
+# =========================
+# 主对话逻辑
 # =========================
 def function_call_playground(
         prompt: str,
@@ -138,19 +197,13 @@ def function_call_playground(
         session_id: str = None,
         system_prompt: str = "You are a helpful AI assistant.",
 ) -> str:
-    """主对话逻辑"""
-
     session_id = session_id or str(int(time.time()))
     messages = load_messages(session_id)
-
-    # 仅在新会话时添加 system prompt
     if not any(msg["role"] == "system" for msg in messages):
-        system_msg = {"role": "system", "content": system_prompt}
-        messages.insert(0, system_msg)
-        logger.info(f"🛠️ 使用 system prompt: {system_prompt}")
+        messages.insert(0, {"role": "system", "content": system_prompt})
 
-    # 当前用户输入
     messages.append({"role": "user", "content": prompt})
+
     while True:
         response = client.chat.completions.create(
             model="Qwen/Qwen3-14B",
@@ -163,14 +216,11 @@ def function_call_playground(
 
         msg = response.choices[0].message
 
-        # 模型直接回答
         if not msg.tool_calls:
             messages.append({"role": "assistant", "content": msg.content})
             save_messages(session_id, messages)
-            logger.info(f"🤖 模型回复: {msg.content}")
             return msg.content
 
-        # 模型调用工具
         messages.append(msg.to_dict())
 
         for tool_call in msg.tool_calls:
@@ -179,13 +229,17 @@ def function_call_playground(
 
             logger.info(f"👉 模型请求调用函数: {func_name}({func_args})")
 
-            if func_name not in func_registry:
-                result = f"❌ Unknown function: {func_name}"
-            else:
+            if func_name in func_registry:
                 try:
                     result = func_registry[func_name](**func_args)
                 except Exception as e:
                     result = f"❌ Error: {e}"
+            else:
+                # 调用 MCP 工具
+                try:
+                    result = call_mcp_tool_sync(func_name, func_args)
+                except Exception as e:
+                    result = f"❌ MCP Error: {e}"
 
             logger.info(f"🔧 执行结果: {result}")
 
@@ -199,13 +253,14 @@ def function_call_playground(
         save_messages(session_id, messages)
 
 
-print(
-    function_call_playground(
-        "请计算 12.34 + 56.78 的值", tools=my_tools, session_id="test_session_001"
-    )
-)
-
-print(
-    function_call_playground(
-        "我说的上句话是什么？", tools=my_tools, session_id="test_session_001"
-    ))
+# =========================
+# 测试
+# =========================
+if __name__ == "__main__":
+    all_tools = my_tools
+    try:
+        all_tools += get_mcp_tools()
+    except Exception as e:
+        logger.warning(f"⚠️ 加载 MCP 工具失败: {e}")
+    print(function_call_playground("合肥天气怎么样", tools=all_tools))
+    # print(function_call_playground("调用远程 add 工具计算 3+5", tools=all_tools, session_id="s1"))
