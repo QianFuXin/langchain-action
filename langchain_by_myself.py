@@ -1,6 +1,7 @@
 """
-支持本地工具 + 远程 MCP 工具调用
+支持本地工具 + 多个远程 MCP 工具调用（覆盖模式）
 """
+
 import os
 import time
 import json
@@ -35,71 +36,10 @@ client = OpenAI(api_key=api_key, base_url="https://api.siliconflow.cn/v1")
 def parse_tool_result(result):
     """统一解析 MCP 工具调用结果"""
     if hasattr(result, "structuredContent") and result.structuredContent:
-        # 结构化优先
         return result.structuredContent.get("result")
     if hasattr(result, "content") and result.content:
-        # 文本结果
         return getattr(result.content[0], "text", None)
     return None
-
-
-# =========================
-# 本地工具注册
-# =========================
-def make_tool_decorator(registry: list, func_map: dict):
-    TYPE_MAP = {int: "number", float: "number", str: "string", bool: "boolean"}
-
-    def tool(description: str = ""):
-        def wrapper(func):
-            sig = inspect.signature(func)
-            hints = typing.get_type_hints(func)
-
-            properties, required = {}, []
-            for name, param in sig.parameters.items():
-                typ = hints.get(name, str)
-                json_type = TYPE_MAP.get(typ, "string")
-                properties[name] = {"type": json_type}
-                required.append(name)
-
-            schema = {
-                "type": "function",
-                "function": {
-                    "name": func.__name__,
-                    "description": description or (func.__doc__ or "").strip(),
-                    "parameters": {
-                        "type": "object",
-                        "properties": properties,
-                        "required": required,
-                    },
-                },
-            }
-            registry.append(schema)
-            func_map[func.__name__] = func
-            logger.debug(f"🔧 注册本地工具: {func.__name__}")
-            return func
-
-        return wrapper
-
-    return tool
-
-
-my_tools: list = []
-func_registry: dict = {}
-tool = make_tool_decorator(my_tools, func_registry)
-
-
-@tool("Calculate the product of two numbers")
-def mul(a: float, b: float) -> float:
-    return a * b
-
-
-@tool("Compare two numbers, which one is bigger")
-def compare(a: float, b: float) -> str:
-    if a > b:
-        return f"{a} is greater than {b}"
-    elif a < b:
-        return f"{b} is greater than {a}"
-    return f"{a} is equal to {b}"
 
 
 # =========================
@@ -132,13 +72,62 @@ def save_messages(session_id: str, messages: list) -> None:
 
 
 # =========================
-# MCP 工具支持
+# 全局工具注册表（覆盖模式）
 # =========================
-def tool_to_openai_format(tool):
-    return {
+TOOL_REGISTRY = {}  # { func_name: {"type": "local"/"mcp", "handler": ...} }
+all_tools = []
+
+
+def local_tool(description=""):
+    """装饰器：注册本地工具并自动加入 all_tools"""
+
+    def wrapper(func):
+        schema = register_local_tool(func, description)
+        all_tools.append(schema)
+        return func
+
+    return wrapper
+
+
+def register_local_tool(func, description=""):
+    """注册本地工具（覆盖模式）"""
+    sig = inspect.signature(func)
+    hints = typing.get_type_hints(func)
+
+    TYPE_MAP = {int: "number", float: "number", str: "string", bool: "boolean"}
+
+    properties, required = {}, []
+    for name, param in sig.parameters.items():
+        typ = hints.get(name, str)
+        json_type = TYPE_MAP.get(typ, "string")
+        properties[name] = {"type": json_type}
+        required.append(name)
+
+    schema = {
         "type": "function",
         "function": {
-            "name": tool.name,
+            "name": func.__name__,
+            "description": description or (func.__doc__ or "").strip(),
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+            },
+        },
+    }
+
+    TOOL_REGISTRY[func.__name__] = {"type": "local", "handler": func}
+    return schema
+
+
+def register_mcp_tool(server_url: str, tool):
+    """注册 MCP 工具（覆盖模式，不加前缀）"""
+    func_name = tool.name
+
+    schema = {
+        "type": "function",
+        "function": {
+            "name": func_name,
             "description": tool.description or "",
             "parameters": {
                 "type": "object",
@@ -153,39 +142,67 @@ def tool_to_openai_format(tool):
         },
     }
 
+    TOOL_REGISTRY[func_name] = {"type": "mcp", "handler": (server_url, tool.name)}
+    return schema
 
-async def fetch_mcp_tools():
-    async with streamablehttp_client("http://localhost:8001/mcp") as (
-            read_stream,
-            write_stream,
-            _,
-    ):
+
+def execute_tool(func_name: str, func_args: dict):
+    """统一执行工具（覆盖模式）"""
+    if func_name not in TOOL_REGISTRY:
+        return f"❌ Unknown tool: {func_name}"
+
+    entry = TOOL_REGISTRY[func_name]
+
+    if entry["type"] == "local":
+        func = entry["handler"]
+        try:
+            return func(**func_args)
+        except Exception as e:
+            return f"❌ Local Error: {e}"
+
+    elif entry["type"] == "mcp":
+        server_url, real_name = entry["handler"]
+        try:
+            return call_mcp_tool_sync(server_url, real_name, func_args)
+        except Exception as e:
+            return f"❌ MCP Error: {e}"
+
+
+# =========================
+# MCP 工具支持
+# =========================
+async def fetch_mcp_tools(server_url: str):
+    async with streamablehttp_client(server_url) as (read_stream, write_stream, _):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             result = await session.list_tools()
             tools = result.tools if hasattr(result, "tools") else result[-1]
-            return [tool_to_openai_format(tool) for tool in tools]
+            return tools
 
 
-def get_mcp_tools():
-    return asyncio.run(fetch_mcp_tools())
+def get_all_mcp_tools(servers):
+    """加载所有 MCP server 的工具并注册"""
+    all_tools = []
+    for server in servers:
+        try:
+            tools = asyncio.run(fetch_mcp_tools(server))
+            for t in tools:
+                all_tools.append(register_mcp_tool(server, t))
+        except Exception as e:
+            logger.warning(f"⚠️ 加载 MCP 工具失败: {server}, {e}")
+    return all_tools
 
 
-async def call_mcp_tool(func_name: str, func_args: dict):
-    """调用 MCP Server 上的工具"""
-    async with streamablehttp_client("http://localhost:8001/mcp") as (
-            read_stream,
-            write_stream,
-            _,
-    ):
+async def call_mcp_tool(server_url: str, func_name: str, func_args: dict):
+    async with streamablehttp_client(server_url) as (read_stream, write_stream, _):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             result = await session.call_tool(func_name, func_args)
             return parse_tool_result(result)
 
 
-def call_mcp_tool_sync(func_name: str, func_args: dict):
-    return asyncio.run(call_mcp_tool(func_name, func_args))
+def call_mcp_tool_sync(server_url: str, func_name: str, func_args: dict):
+    return asyncio.run(call_mcp_tool(server_url, func_name, func_args))
 
 
 # =========================
@@ -229,17 +246,7 @@ def function_call_playground(
 
             logger.info(f"👉 模型请求调用函数: {func_name}({func_args})")
 
-            if func_name in func_registry:
-                try:
-                    result = func_registry[func_name](**func_args)
-                except Exception as e:
-                    result = f"❌ Error: {e}"
-            else:
-                # 调用 MCP 工具
-                try:
-                    result = call_mcp_tool_sync(func_name, func_args)
-                except Exception as e:
-                    result = f"❌ MCP Error: {e}"
+            result = execute_tool(func_name, func_args)
 
             logger.info(f"🔧 执行结果: {result}")
 
@@ -253,14 +260,28 @@ def function_call_playground(
         save_messages(session_id, messages)
 
 
-# =========================
-# 测试
-# =========================
+@local_tool("Calculate the product of two numbers")
+def mul(a: float, b: float) -> float:
+    return a * b
+
+
+@local_tool("Compare two numbers, which one is bigger")
+def compare(a: float, b: float) -> str:
+    if a > b:
+        return f"{a} is greater than {b}"
+    elif a < b:
+        return f"{b} is greater than {a}"
+    return f"{a} is equal to {b}"
+
+
 if __name__ == "__main__":
-    all_tools = my_tools
-    try:
-        all_tools += get_mcp_tools()
-    except Exception as e:
-        logger.warning(f"⚠️ 加载 MCP 工具失败: {e}")
-    print(function_call_playground("合肥天气怎么样", tools=all_tools))
-    # print(function_call_playground("调用远程 add 工具计算 3+5", tools=all_tools, session_id="s1"))
+    # MCP server 列表
+    MCP_SERVERS = [
+        "http://localhost:8001/mcp",
+        "http://localhost:8002/mcp",
+    ]
+
+    # 远程 MCP 工具
+    all_tools += get_all_mcp_tools(MCP_SERVERS)
+    # 测试调用
+    print(function_call_playground("计算12*1111", tools=all_tools))
